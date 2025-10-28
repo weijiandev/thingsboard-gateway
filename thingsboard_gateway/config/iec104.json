@@ -2,7 +2,13 @@
   "name": "IEC104 Connector",
   "type": "iec104",
   "client": {
-    "class": "thingsboard_gateway.connectors.iec104.client.DummyIEC104Client"
+    "class": "thingsboard_gateway.connectors.iec104.client.RemoteIEC104Client",
+    "host": "127.0.0.1",
+    "port": 2404,
+    "timeout": 10,
+    "interrogationTimeout": 15,
+    "commandTimeout": 5,
+    "selectBeforeOperate": false
   },
   "defaultPollPeriod": 30,
   "devices": [
