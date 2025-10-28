@@ -25,6 +25,11 @@ class IEC104ClientBase(ABC):
     def set_listener(self, listener: UpdateCallback) -> None:
         self._listener = listener
 
+    def is_connected(self) -> bool:
+        """Return whether the IEC-104 client considers itself connected."""
+
+        return True
+
     @abstractmethod
     def connect(self) -> None:
         """Establish connection with the IEC-104 server."""
@@ -176,6 +181,10 @@ class RemoteIEC104Client(IEC104ClientBase):
         self._command_context: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         self._context_lock = Lock()
 
+    def is_connected(self) -> bool:
+        with self._socket_lock:
+            return self._running.is_set() and self._socket is not None
+
     # region IEC-104 connection lifecycle
     def connect(self) -> None:
         self._logger.debug("Connecting to IEC-104 server %s:%s", self._host, self._port)
@@ -204,18 +213,18 @@ class RemoteIEC104Client(IEC104ClientBase):
 
     def close(self) -> None:
         self._running.clear()
-        if self._socket:
-            with self._socket_lock:
+        sock: Optional[socket.socket] = None
+        with self._socket_lock:
+            if self._socket:
+                sock = self._socket
                 try:
-                    self._send_u_frame(self.STOPDT_ACT)
-                except Exception:  # pragma: no cover - best effort during shutdown
+                    frame = bytearray([0x68, 0x04, self.STOPDT_ACT, 0x00, 0x00, 0x00])
+                    sock.sendall(frame)
+                except OSError:  # pragma: no cover - best effort during shutdown
                     pass
-                try:
-                    self._socket.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                self._socket.close()
-            self._socket = None
+                self._socket = None
+
+        self._cleanup_socket(sock)
 
         if self._receive_thread and self._receive_thread.is_alive():
             self._receive_thread.join(timeout=5)
@@ -225,9 +234,25 @@ class RemoteIEC104Client(IEC104ClientBase):
 
     # region public API
     def interrogate(self, device_config: Dict[str, Any], points: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
-        common_address = device_config.get("commonAddress")
-        if common_address is None:
+        common_address_raw = device_config.get("commonAddress")
+        if common_address_raw is None:
             raise ValueError("Device configuration must define 'commonAddress' for IEC-104 interrogation")
+
+        try:
+            common_address = int(common_address_raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"IEC-104 device commonAddress must be an integer, got {common_address_raw!r}"
+            ) from None
+
+        if not isinstance(points, list):
+            points = list(points)
+
+        self._logger.debug(
+            "Sending general interrogation for common address %s covering %s points",
+            common_address,
+            len(points),
+        )
 
         with self._context_lock:
             ctx = {"event": Event(), "updates": []}
@@ -238,6 +263,12 @@ class RemoteIEC104Client(IEC104ClientBase):
         completed = ctx["event"].wait(self._interrogation_timeout)
         if not completed:
             self._logger.warning("General interrogation timed out for common address %s", common_address)
+        else:
+            self._logger.debug(
+                "General interrogation for common address %s completed with %s updates",
+                common_address,
+                len(ctx["updates"]),
+            )
 
         with self._context_lock:
             self._interrogation_context.pop(common_address, None)
@@ -250,13 +281,27 @@ class RemoteIEC104Client(IEC104ClientBase):
         if type_id is None:
             raise ValueError(f"Unsupported IEC-104 command type: {command_type}")
 
-        common_address = request.get("common_address") or request.get("commonAddress")
-        if common_address is None:
+        common_address_raw = request.get("common_address") or request.get("commonAddress")
+        if common_address_raw is None:
             raise ValueError("IEC-104 command requires 'commonAddress'")
 
-        io_address = request.get("io_address") or request.get("ioAddress")
-        if io_address is None:
+        try:
+            common_address = int(common_address_raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"IEC-104 command commonAddress must be an integer, got {common_address_raw!r}"
+            ) from None
+
+        io_address_raw = request.get("io_address") or request.get("ioAddress")
+        if io_address_raw is None:
             raise ValueError("IEC-104 command requires 'ioAddress'")
+
+        try:
+            io_address = int(io_address_raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"IEC-104 command ioAddress must be an integer, got {io_address_raw!r}"
+            ) from None
 
         select = bool(request.get("select", self._select_before_operate))
         qualifier = int(request.get("qualifier", request.get("qos", request.get("qoi", 0)))) & 0xFF
@@ -293,6 +338,7 @@ class RemoteIEC104Client(IEC104ClientBase):
                 if not chunk:
                     self._logger.warning("IEC-104 connection closed by remote host")
                     break
+                self._logger.debug("Received %s raw IEC-104 bytes", len(chunk))
                 self._buffer.extend(chunk)
                 self._process_buffer()
             except (OSError, ConnectionError) as exc:
@@ -304,20 +350,39 @@ class RemoteIEC104Client(IEC104ClientBase):
                 break
 
         self._running.clear()
+        with self._socket_lock:
+            sock = self._socket
+            self._socket = None
+        self._cleanup_socket(sock)
         self._start_confirmed.set()
 
     def _process_buffer(self) -> None:
         while True:
             if len(self._buffer) < 2:
+                if self._buffer:
+                    self._logger.debug(
+                        "Waiting for IEC-104 frame header, buffered %s byte(s)",
+                        len(self._buffer),
+                    )
                 return
             if self._buffer[0] != 0x68:
+                self._logger.debug(
+                    "Dropping IEC-104 buffer byte 0x%02X while seeking start flag",
+                    self._buffer[0],
+                )
                 self._buffer.pop(0)
                 continue
             length = self._buffer[1]
             if len(self._buffer) < 2 + length:
+                self._logger.debug(
+                    "Partial IEC-104 frame buffered=%s expected=%s",
+                    len(self._buffer) - 2,
+                    length,
+                )
                 return
             frame = bytes(self._buffer[2 : 2 + length])
             del self._buffer[: 2 + length]
+            self._logger.debug("Assembled IEC-104 frame payload length %s", length)
             self._handle_frame(frame)
 
     def _handle_frame(self, frame: bytes) -> None:
@@ -333,6 +398,11 @@ class RemoteIEC104Client(IEC104ClientBase):
             self._send_s_frame()
 
             if asdu:
+                self._logger.debug(
+                    "Received IEC-104 I-format frame seq=%s with ASDU length %s",
+                    send_seq,
+                    len(asdu),
+                )
                 self._handle_asdu(asdu)
         elif first_byte & 0x03 == 1:  # S-format
             recv_seq = struct.unpack("<H", control[2:])[0] >> 1
@@ -368,7 +438,7 @@ class RemoteIEC104Client(IEC104ClientBase):
         number = vsq & 0x7F or 1
         cause_raw = asdu[2] | (asdu[3] << 8)
         cause = cause_raw & 0x3F
-        positive = not bool(asdu[3] & 0x40)
+        positive = not bool(asdu[2] & 0x40)
         common_address = asdu[5] | (asdu[6] << 8)
 
         offset = 7
@@ -386,11 +456,26 @@ class RemoteIEC104Client(IEC104ClientBase):
             self._logger.debug("Unsupported IEC-104 ASDU type %s", type_id)
             return
 
+        self._logger.debug(
+            "Processing IEC-104 ASDU type=%s cause=%s positive=%s common=%s entries=%s sq=%s",
+            type_id,
+            cause,
+            positive,
+            common_address,
+            number,
+            sq,
+        )
+
         entries, _ = self._extract_information_objects(asdu, offset, number, entry_size, sq)
         timestamp = int(time() * 1000)
         for io_address, data in entries:
             value, quality, ts = self._decode_information_element(type_id, data, timestamp)
             if value is None:
+                self._logger.debug(
+                    "Decoded IEC-104 information element returned no value for IOA %s (type %s)",
+                    io_address,
+                    type_id,
+                )
                 continue
             update = {
                 "common_address": common_address,
@@ -401,6 +486,15 @@ class RemoteIEC104Client(IEC104ClientBase):
                 "cause": cause,
                 "positive": positive,
             }
+            self._logger.debug(
+                "Registering IEC-104 measurement update CA=%s IOA=%s value=%r quality=%s ts=%s cause=%s",
+                common_address,
+                io_address,
+                value,
+                quality,
+                ts,
+                cause,
+            )
             self._register_update(update)
 
     def _handle_interrogation_response(self, common_address: int, cause: int) -> None:
@@ -440,6 +534,12 @@ class RemoteIEC104Client(IEC104ClientBase):
             ctx = self._interrogation_context.get(update["common_address"])
             if ctx is not None:
                 ctx["updates"].append(update)
+                self._logger.debug(
+                    "Stored IEC-104 interrogation update CA=%s IOA=%s (total stored: %s)",
+                    update["common_address"],
+                    update["io_address"],
+                    len(ctx["updates"]),
+                )
         self._emit_update(update)
 
     def _send_general_interrogation(self, common_address: int, qualifier: int) -> None:
@@ -506,10 +606,10 @@ class RemoteIEC104Client(IEC104ClientBase):
         return bytes(asdu)
 
     def _send_i_frame(self, asdu: bytes) -> None:
-        if not self._socket:
-            raise ConnectionError("IEC-104 socket is not available")
-
         with self._socket_lock:
+            if not self._socket:
+                raise ConnectionError("IEC-104 socket is not available")
+
             send_seq = (self._send_seq << 1) & 0xFFFF
             recv_seq = (self._expected_recv_seq << 1) & 0xFFFF
             control = struct.pack("<HH", send_seq, recv_seq)
@@ -519,7 +619,11 @@ class RemoteIEC104Client(IEC104ClientBase):
             frame.append(length)
             frame.extend(control)
             frame.extend(asdu)
-            self._socket.sendall(frame)
+            try:
+                self._socket.sendall(frame)
+            except OSError as exc:
+                self._handle_send_error(exc)
+                return
             self._send_seq = (self._send_seq + 1) % 32768
 
     def _send_s_frame(self) -> None:
@@ -527,23 +631,52 @@ class RemoteIEC104Client(IEC104ClientBase):
             return
 
         with self._socket_lock:
+            if not self._socket:
+                return
             recv_seq = (self._expected_recv_seq << 1) & 0xFFFF
             frame = bytearray([0x68, 0x04, 0x01, 0x00])
             frame.extend(struct.pack("<H", recv_seq))
             try:
                 self._socket.sendall(frame)
-            except OSError:  # pragma: no cover - acknowledgement best effort
-                pass
+            except OSError as exc:  # pragma: no cover - acknowledgement best effort
+                self._handle_send_error(exc)
 
     def _send_u_frame(self, code: int) -> None:
-        if not self._socket:
-            raise ConnectionError("IEC-104 socket is not available")
-
         with self._socket_lock:
+            if not self._socket:
+                raise ConnectionError("IEC-104 socket is not available")
+
             frame = bytearray([0x68, 0x04, code, 0x00, 0x00, 0x00])
-            self._socket.sendall(frame)
+            try:
+                self._socket.sendall(frame)
+            except OSError as exc:
+                self._handle_send_error(exc)
 
     # endregion
+
+    def _cleanup_socket(self, sock: Optional[socket.socket]) -> None:
+        if not sock:
+            return
+
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _handle_send_error(self, exc: OSError) -> None:
+        self._logger.warning("IEC-104 socket send failed: %s", exc)
+        sock = self._socket
+        self._socket = None
+        self._running.clear()
+        self._start_confirmed.set()
+        self._send_seq = 0
+        self._expected_recv_seq = 0
+        self._cleanup_socket(sock)
+        raise ConnectionError("IEC-104 socket send failed") from exc
 
     # region decoding helpers
     @staticmethod
@@ -639,6 +772,11 @@ class RemoteIEC104Client(IEC104ClientBase):
         entries: List[Tuple[int, bytes]] = []
         if sq:
             if len(asdu) < offset + 3:
+                self._logger.debug(
+                    "IEC-104 ASDU too short for sequential IOA list: expected base at offset %s, length %s",
+                    offset,
+                    len(asdu),
+                )
                 return entries, len(asdu)
             io_base = asdu[offset] | (asdu[offset + 1] << 8) | (asdu[offset + 2] << 16)
             offset += 3
@@ -646,17 +784,34 @@ class RemoteIEC104Client(IEC104ClientBase):
                 start = offset + index * element_size
                 end = start + element_size
                 if end > len(asdu):
+                    self._logger.debug(
+                        "IEC-104 ASDU truncated while reading sequential IOAs: start=%s end=%s len=%s",
+                        start,
+                        end,
+                        len(asdu),
+                    )
                     return [], len(asdu)
                 entries.append((io_base + index, asdu[start:end]))
             offset += number * element_size
         else:
             for _ in range(number):
                 if len(asdu) < offset + 3:
+                    self._logger.debug(
+                        "IEC-104 ASDU too short while reading IOA at offset %s (len=%s)",
+                        offset,
+                        len(asdu),
+                    )
                     return entries, len(asdu)
                 io_address = asdu[offset] | (asdu[offset + 1] << 8) | (asdu[offset + 2] << 16)
                 offset += 3
                 end = offset + element_size
                 if end > len(asdu):
+                    self._logger.debug(
+                        "IEC-104 ASDU truncated while reading element payload: start=%s end=%s len=%s",
+                        offset,
+                        end,
+                        len(asdu),
+                    )
                     return [], len(asdu)
                 entries.append((io_address, asdu[offset:end]))
                 offset = end
