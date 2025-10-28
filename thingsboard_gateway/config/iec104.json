@@ -1,0 +1,53 @@
+{
+  "name": "IEC104 Connector",
+  "type": "iec104",
+  "client": {
+    "class": "thingsboard_gateway.connectors.iec104.client.RemoteIEC104Client",
+    "host": "127.0.0.1",
+    "port": 2404,
+    "timeout": 10,
+    "interrogationTimeout": 15,
+    "commandTimeout": 5,
+    "selectBeforeOperate": false
+  },
+  "defaultPollPeriod": 30,
+  "devices": [
+    {
+      "deviceName": "IEC104 Device",
+      "deviceType": "iec104",
+      "commonAddress": 1,
+      "converter": "IEC104UplinkConverter",
+      "pollPeriod": 10,
+      "metadata": {
+        "protocol": "iec104"
+      },
+      "points": [
+        {
+          "name": "Voltage",
+          "ioAddress": 1001,
+          "type": "telemetry",
+          "key": "voltage",
+          "defaultValue": 220.0,
+          "simulate": true
+        },
+        {
+          "name": "SwitchState",
+          "ioAddress": 2001,
+          "type": "attribute",
+          "key": "switch",
+          "defaultValue": "open",
+          "simulate": true
+        }
+      ],
+      "serverSideRpc": [
+        {
+          "deviceNameFilter": "IEC104 Device",
+          "methodFilter": "setSwitch",
+          "ioAddress": 2001,
+          "command": "single",
+          "converter": "IEC104DownlinkConverter"
+        }
+      ]
+    }
+  ]
+}
