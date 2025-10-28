@@ -218,6 +218,16 @@ class IEC104Connector(Connector, Thread):
     # region internal helpers
     def _load_devices(self, devices: List[Dict[str, Any]]) -> None:
         for device in devices:
+            device_common_address = self._normalize_address(device.get("commonAddress"))
+            if device_common_address is None and device.get("commonAddress") is not None:
+                self._log.error(
+                    "IEC-104 device %s has invalid commonAddress %r",
+                    device.get("deviceName"),
+                    device.get("commonAddress"),
+                )
+            elif device_common_address is not None:
+                device["commonAddress"] = device_common_address
+
             converter_class_name = device.get("converter", DEFAULT_UPLINK_CONVERTER)
             converter_cls = TBModuleLoader.import_module(self._connector_type, converter_class_name)
             if not converter_cls:
@@ -227,11 +237,31 @@ class IEC104Connector(Connector, Thread):
             converter = converter_cls(device, self._converter_log)
 
             for point in device.get("points", []):
-                common_address = point.get("commonAddress", device.get("commonAddress"))
-                io_address = point.get("ioAddress")
-                if io_address is None:
-                    self._log.error("IEC-104 point in device %s is missing ioAddress", device.get("deviceName"))
+                point_common_address_raw = point.get("commonAddress", device.get("commonAddress"))
+                common_address = self._normalize_address(point_common_address_raw)
+                if common_address is None:
+                    self._log.error(
+                        "IEC-104 point %s in device %s has invalid commonAddress %r",
+                        point.get("name"),
+                        device.get("deviceName"),
+                        point_common_address_raw,
+                    )
                     continue
+
+                io_address_raw = point.get("ioAddress")
+                io_address = self._normalize_address(io_address_raw)
+                if io_address is None:
+                    self._log.error(
+                        "IEC-104 point %s in device %s has invalid ioAddress %r",
+                        point.get("name"),
+                        device.get("deviceName"),
+                        io_address_raw,
+                    )
+                    continue
+
+                point["ioAddress"] = io_address
+                if "commonAddress" in point:
+                    point["commonAddress"] = common_address
 
                 key = (common_address, io_address)
                 self._points_map[key] = {
@@ -252,6 +282,28 @@ class IEC104Connector(Connector, Thread):
         prepared.setdefault("methodFilter", config.get("method", ".*"))
         prepared.setdefault("attributeFilter", config.get("attribute", ".*"))
         prepared.setdefault("commonAddress", config.get("commonAddress", device.get("commonAddress")))
+
+        prepared_common_address = self._normalize_address(prepared.get("commonAddress"))
+        if prepared_common_address is not None:
+            prepared["commonAddress"] = prepared_common_address
+        elif prepared.get("commonAddress") is not None:
+            self._log.error(
+                "IEC-104 configuration for device %s has invalid commonAddress %r",
+                device.get("deviceName"),
+                prepared.get("commonAddress"),
+            )
+
+        if "ioAddress" in prepared:
+            prepared_io_address = self._normalize_address(prepared.get("ioAddress"))
+            if prepared_io_address is not None:
+                prepared["ioAddress"] = prepared_io_address
+            elif prepared.get("ioAddress") is not None:
+                self._log.error(
+                    "IEC-104 configuration for device %s has invalid ioAddress %r",
+                    device.get("deviceName"),
+                    prepared.get("ioAddress"),
+                )
+
         prepared["device"] = device
         prepared["point"] = config
 
@@ -264,10 +316,31 @@ class IEC104Connector(Connector, Thread):
         prepared["converter"] = converter_cls(config, self._converter_log)
         return prepared
 
+    @staticmethod
+    def _normalize_address(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
     def _poll_device(self, device: Dict[str, Any], poll_period: int) -> None:
         while not self._stopped.wait(poll_period):
             try:
+                self._log.debug(
+                    "Starting IEC-104 interrogation for device %s with %s configured points",
+                    device.get("deviceName"),
+                    len(device.get("points", [])),
+                )
                 responses = self._client.interrogate(device, device.get("points", []))
+                self._log.debug(
+                    "IEC-104 interrogation for device %s returned %s responses",
+                    device.get("deviceName"),
+                    len(responses) if isinstance(responses, list) else "unknown",
+                )
                 for response in responses:
                     self._on_point_update(response)
             except ConnectionError as exc:
@@ -282,6 +355,14 @@ class IEC104Connector(Connector, Thread):
                 self._log.exception("Failed to interrogate IEC-104 device %s", device.get("deviceName"))
 
     def _on_point_update(self, data: Dict[str, Any]) -> None:
+        self._log.debug(
+            "Queueing IEC-104 update CA=%s IOA=%s value=%r quality=%s cause=%s",
+            data.get("common_address"),
+            data.get("io_address"),
+            data.get("value"),
+            data.get("quality"),
+            data.get("cause"),
+        )
         self._data_queue.put(data)
 
     def _process_data(self) -> None:
@@ -294,7 +375,11 @@ class IEC104Connector(Connector, Thread):
             key = (item.get("common_address"), item.get("io_address"))
             mapping = self._points_map.get(key)
             if not mapping:
-                self._log.debug("Received IEC-104 update for unknown point %s", key)
+                self._log.debug(
+                    "Received IEC-104 update for unknown point %s (known points: %s)",
+                    key,
+                    list(self._points_map.keys()),
+                )
                 continue
 
             converter = mapping["converter"]
@@ -307,6 +392,11 @@ class IEC104Connector(Connector, Thread):
                 )
                 StatisticsService.count_connector_message(self.name, 'convertedMessages', count=1)
                 self._gateway.send_to_storage(self.get_name(), self.get_id(), converted)
+            else:
+                self._log.debug(
+                    "IEC-104 update for point %s produced no telemetry or attributes after conversion",
+                    key,
+                )
 
     def _process_commands(self) -> None:
         while not self._stopped.is_set():
