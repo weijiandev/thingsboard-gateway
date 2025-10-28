@@ -1,13 +1,13 @@
 {
   "thingsboard": {
-    "host": "thingsboard.cloud",
-    "port": 1883,
+    "host": "172.16.13.149",
+    "port": 31883,
     "remoteShell": false,
     "remoteConfiguration": true,
     "latencyDebugMode": false,
     "statistics": {
       "enable": true,
-      "statsSendPeriodInSeconds": 60,
+      "statsSendPeriodInSeconds": 3600,
       "customStatsSendPeriodInSeconds": 3600
     },
     "deviceFiltering": {
@@ -21,11 +21,13 @@
     "handleDeviceRenaming": true,
     "security": {
       "type": "accessToken",
-      "accessToken": "YOUR_ACCESS_TOKEN"
+      "accessToken": "80GXGwbW47ljnkJxRr22"
     },
     "qos": 1,
     "reportStrategy": {
-      "type": "ON_RECEIVED"
+      "type": "ON_RECEIVED",
+      "reportPeriod": 10000,
+      "ttl": 86400
     },
     "checkingDeviceActivity": {
       "checkDeviceInactivity": false,
@@ -37,7 +39,8 @@
     "messagesRateLimits": "DEFAULT_MESSAGES_RATE_LIMIT",
     "deviceMessagesRateLimits": "DEFAULT_MESSAGES_RATE_LIMIT",
     "deviceRateLimits": "DEFAULT_TELEMETRY_RATE_LIMIT",
-    "deviceDpRateLimits": "DEFAULT_TELEMETRY_DP_RATE_LIMIT"
+    "deviceDpRateLimits": "DEFAULT_TELEMETRY_DP_RATE_LIMIT",
+    "ts": 1761620066891
   },
   "storage": {
     "type": "memory",
@@ -47,9 +50,10 @@
     "max_file_count": 10,
     "max_read_records_count": 10,
     "max_records_per_file": 10000,
-    "data_file_path": "./data/",
+    "data_file_path": "./data/data.db",
     "messages_ttl_check_in_hours": 1,
-    "messages_ttl_in_days": 7
+    "messages_ttl_in_days": 7,
+    "ts": 1761620066891
   },
   "grpc": {
     "enabled": false,
@@ -61,5 +65,12 @@
     "minTimeBetweenPingsMs": 10000,
     "minPingIntervalWithoutDataMs": 5000
   },
-  "connectors": []
+  "connectors": [
+    {
+      "type": "iec104",
+      "name": "iec104",
+      "configuration": "iec104.json",
+      "class": "IEC104Connector"
+    }
+  ]
 }

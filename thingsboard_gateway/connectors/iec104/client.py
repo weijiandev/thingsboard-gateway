@@ -439,9 +439,9 @@ class RemoteIEC104Client(IEC104ClientBase):
         cause_raw = asdu[2] | (asdu[3] << 8)
         cause = cause_raw & 0x3F
         positive = not bool(asdu[2] & 0x40)
-        common_address = asdu[5] | (asdu[6] << 8)
+        common_address = asdu[4] | (asdu[5] << 8)
 
-        offset = 7
+        offset = 6
 
         if type_id == self.GENERAL_INTERROGATION:
             self._handle_interrogation_response(common_address, cause)

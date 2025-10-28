@@ -26,3 +26,4 @@ venv
 /tests/blackbox/connectors/opcua/_trial_temp/
 /tests/blackbox/connectors/modbus/_trial_temp/
 *.DS_Store
+things/*
