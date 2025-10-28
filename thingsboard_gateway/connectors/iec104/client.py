@@ -25,6 +25,11 @@ class IEC104ClientBase(ABC):
     def set_listener(self, listener: UpdateCallback) -> None:
         self._listener = listener
 
+    def is_connected(self) -> bool:
+        """Return whether the IEC-104 client considers itself connected."""
+
+        return True
+
     @abstractmethod
     def connect(self) -> None:
         """Establish connection with the IEC-104 server."""
@@ -176,6 +181,10 @@ class RemoteIEC104Client(IEC104ClientBase):
         self._command_context: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         self._context_lock = Lock()
 
+    def is_connected(self) -> bool:
+        with self._socket_lock:
+            return self._running.is_set() and self._socket is not None
+
     # region IEC-104 connection lifecycle
     def connect(self) -> None:
         self._logger.debug("Connecting to IEC-104 server %s:%s", self._host, self._port)
@@ -204,18 +213,18 @@ class RemoteIEC104Client(IEC104ClientBase):
 
     def close(self) -> None:
         self._running.clear()
-        if self._socket:
-            with self._socket_lock:
+        sock: Optional[socket.socket] = None
+        with self._socket_lock:
+            if self._socket:
+                sock = self._socket
                 try:
-                    self._send_u_frame(self.STOPDT_ACT)
-                except Exception:  # pragma: no cover - best effort during shutdown
+                    frame = bytearray([0x68, 0x04, self.STOPDT_ACT, 0x00, 0x00, 0x00])
+                    sock.sendall(frame)
+                except OSError:  # pragma: no cover - best effort during shutdown
                     pass
-                try:
-                    self._socket.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                self._socket.close()
-            self._socket = None
+                self._socket = None
+
+        self._cleanup_socket(sock)
 
         if self._receive_thread and self._receive_thread.is_alive():
             self._receive_thread.join(timeout=5)
@@ -304,6 +313,10 @@ class RemoteIEC104Client(IEC104ClientBase):
                 break
 
         self._running.clear()
+        with self._socket_lock:
+            sock = self._socket
+            self._socket = None
+        self._cleanup_socket(sock)
         self._start_confirmed.set()
 
     def _process_buffer(self) -> None:
@@ -506,10 +519,10 @@ class RemoteIEC104Client(IEC104ClientBase):
         return bytes(asdu)
 
     def _send_i_frame(self, asdu: bytes) -> None:
-        if not self._socket:
-            raise ConnectionError("IEC-104 socket is not available")
-
         with self._socket_lock:
+            if not self._socket:
+                raise ConnectionError("IEC-104 socket is not available")
+
             send_seq = (self._send_seq << 1) & 0xFFFF
             recv_seq = (self._expected_recv_seq << 1) & 0xFFFF
             control = struct.pack("<HH", send_seq, recv_seq)
@@ -519,7 +532,11 @@ class RemoteIEC104Client(IEC104ClientBase):
             frame.append(length)
             frame.extend(control)
             frame.extend(asdu)
-            self._socket.sendall(frame)
+            try:
+                self._socket.sendall(frame)
+            except OSError as exc:
+                self._handle_send_error(exc)
+                return
             self._send_seq = (self._send_seq + 1) % 32768
 
     def _send_s_frame(self) -> None:
@@ -527,23 +544,52 @@ class RemoteIEC104Client(IEC104ClientBase):
             return
 
         with self._socket_lock:
+            if not self._socket:
+                return
             recv_seq = (self._expected_recv_seq << 1) & 0xFFFF
             frame = bytearray([0x68, 0x04, 0x01, 0x00])
             frame.extend(struct.pack("<H", recv_seq))
             try:
                 self._socket.sendall(frame)
-            except OSError:  # pragma: no cover - acknowledgement best effort
-                pass
+            except OSError as exc:  # pragma: no cover - acknowledgement best effort
+                self._handle_send_error(exc)
 
     def _send_u_frame(self, code: int) -> None:
-        if not self._socket:
-            raise ConnectionError("IEC-104 socket is not available")
-
         with self._socket_lock:
+            if not self._socket:
+                raise ConnectionError("IEC-104 socket is not available")
+
             frame = bytearray([0x68, 0x04, code, 0x00, 0x00, 0x00])
-            self._socket.sendall(frame)
+            try:
+                self._socket.sendall(frame)
+            except OSError as exc:
+                self._handle_send_error(exc)
 
     # endregion
+
+    def _cleanup_socket(self, sock: Optional[socket.socket]) -> None:
+        if not sock:
+            return
+
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _handle_send_error(self, exc: OSError) -> None:
+        self._logger.warning("IEC-104 socket send failed: %s", exc)
+        sock = self._socket
+        self._socket = None
+        self._running.clear()
+        self._start_confirmed.set()
+        self._send_seq = 0
+        self._expected_recv_seq = 0
+        self._cleanup_socket(sock)
+        raise ConnectionError("IEC-104 socket send failed") from exc
 
     # region decoding helpers
     @staticmethod

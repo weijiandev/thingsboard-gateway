@@ -6,8 +6,8 @@ from queue import Empty, Queue
 from random import choice
 from re import fullmatch
 from string import ascii_lowercase
-from threading import Event, Thread
-from time import sleep
+from threading import Event, Lock, Thread
+from time import sleep, time
 from typing import Any, Dict, List, Optional, Tuple
 
 from thingsboard_gateway.connectors.connector import Connector
@@ -73,6 +73,10 @@ class IEC104Connector(Connector, Thread):
         self._attribute_updates: List[Dict[str, Any]] = []
         self._rpc_requests: List[Dict[str, Any]] = []
 
+        self._reconnect_lock = Lock()
+        self._reconnect_period = int(config.get("reconnectPeriod", 5))
+        self._next_reconnect_time: float = 0.0
+
         self._load_devices(config.get("devices", []))
 
     # region base connector API
@@ -127,10 +131,11 @@ class IEC104Connector(Connector, Thread):
         self._log.info("Starting IEC-104 connector")
         try:
             self._client.connect()
-            self._connected = True
+            self._connected = getattr(self._client, "is_connected", lambda: True)()
         except Exception as e:  # pragma: no cover - connection errors are logged only
             self._log.exception("Failed to establish IEC-104 connection: %s", e)
             self._connected = False
+            self._handle_connection_loss(e)
 
         self._processing_thread = Thread(target=self._process_data, daemon=True, name="IEC104 Data Processor")
         self._processing_thread.start()
@@ -254,6 +259,14 @@ class IEC104Connector(Connector, Thread):
                 responses = self._client.interrogate(device, device.get("points", []))
                 for response in responses:
                     self._on_point_update(response)
+            except ConnectionError as exc:
+                self._log.warning(
+                    "Failed to interrogate IEC-104 device %s due to connection issue: %s",
+                    device.get("deviceName"),
+                    exc,
+                )
+                self._connected = False
+                self._handle_connection_loss(exc)
             except Exception:  # pragma: no cover - defensive logging
                 self._log.exception("Failed to interrogate IEC-104 device %s", device.get("deviceName"))
 
@@ -298,6 +311,17 @@ class IEC104Connector(Connector, Thread):
                         req_id=originator["data"]["id"],
                         content=result if result is not None else {"success": True},
                     )
+            except ConnectionError as exc:
+                self._log.warning("Failed to send IEC-104 command due to connection issue: %s", exc)
+                self._connected = False
+                self._handle_connection_loss(exc)
+                if originator:
+                    self._gateway.send_rpc_reply(
+                        device=originator["device"],
+                        req_id=originator["data"]["id"],
+                        content={"error": str(exc)},
+                        success_sent=False,
+                    )
             except Exception as e:  # pragma: no cover - defensive logging
                 self._log.exception("Failed to send IEC-104 command: %s", e)
                 if originator:
@@ -308,3 +332,47 @@ class IEC104Connector(Connector, Thread):
                         success_sent=False,
                     )
     # endregion
+
+    def _handle_connection_loss(self, error: Exception) -> None:
+        if self._stopped.is_set():
+            return
+
+        client_is_connected = getattr(self._client, "is_connected", lambda: False)
+        if client_is_connected():
+            self._connected = True
+            return
+
+        reconnect_period = max(self._reconnect_period, 0)
+        with self._reconnect_lock:
+            if client_is_connected():
+                self._connected = True
+                return
+
+            now = time()
+            if reconnect_period and self._next_reconnect_time and now < self._next_reconnect_time:
+                return
+
+            if reconnect_period:
+                self._next_reconnect_time = now + reconnect_period
+            else:
+                self._next_reconnect_time = 0.0
+
+            self._log.warning("IEC-104 connection lost (%s). Attempting to reconnect.", error)
+
+            try:
+                self._client.close()
+            except Exception:  # pragma: no cover - defensive logging
+                self._log.debug("Failed to close IEC-104 client before reconnecting", exc_info=True)
+
+            try:
+                self._client.connect()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self._log.warning("IEC-104 reconnect attempt failed: %s", exc)
+                return
+
+            self._connected = getattr(self._client, "is_connected", lambda: True)()
+            if self._connected:
+                self._log.info("IEC-104 client reconnected successfully")
+                self._next_reconnect_time = 0.0
+            else:
+                self._log.warning("IEC-104 client reconnect attempt did not establish connection")
