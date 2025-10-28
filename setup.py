@@ -62,6 +62,7 @@ setup(
               'thingsboard_gateway.connectors.ftp', 'thingsboard_gateway.extensions.ftp',
               'thingsboard_gateway.connectors.knx', 'thingsboard_gateway.extensions.knx',
               'thingsboard_gateway.connectors.knx.entities',
+              'thingsboard_gateway.connectors.iec104', 'thingsboard_gateway.extensions.iec104',
               'thingsboard_gateway.tb_utility', 'thingsboard_gateway.extensions',
               'thingsboard_gateway.extensions.serial'
               ],
