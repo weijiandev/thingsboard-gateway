@@ -7,7 +7,7 @@ from random import choice
 from re import fullmatch
 from string import ascii_lowercase
 from threading import Event, Lock, Thread
-from time import sleep, time
+from time import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from thingsboard_gateway.connectors.connector import Connector
@@ -155,8 +155,19 @@ class IEC104Connector(Connector, Thread):
                 thread.start()
                 self._polling_threads.append(thread)
 
-        while not self._stopped.is_set():
-            sleep(1)
+        while not self._stopped.wait(1):
+            try:
+                client_is_connected = getattr(self._client, "is_connected", lambda: True)()
+            except Exception:  # pragma: no cover - defensive logging
+                client_is_connected = False
+
+            if client_is_connected:
+                if not self._connected:
+                    self._connected = True
+            else:
+                if self._connected:
+                    self._connected = False
+                self._handle_connection_loss(ConnectionError("IEC-104 client reported disconnection"))
 
     # region ThingsBoard handlers
     def on_attributes_update(self, content):
@@ -290,7 +301,10 @@ class IEC104Connector(Connector, Thread):
             converted: ConvertedData = converter.convert(mapping, item)
 
             if converted.telemetry_datapoints_count or converted.attributes_datapoints_count:
-                self._log.debug("Converted IEC-104 data: %s", converted)
+                self._log.info(
+                    "Collected IEC-104 data: %s",
+                    converted.to_dict(debug_enabled=True),
+                )
                 StatisticsService.count_connector_message(self.name, 'convertedMessages', count=1)
                 self._gateway.send_to_storage(self.get_name(), self.get_id(), converted)
 
