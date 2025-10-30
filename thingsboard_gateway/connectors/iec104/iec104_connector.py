@@ -6,8 +6,8 @@ from queue import Empty, Queue
 from random import choice
 from re import fullmatch
 from string import ascii_lowercase
-from threading import Event, Thread
-from time import sleep
+from threading import Event, Lock, Thread
+from time import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from thingsboard_gateway.connectors.connector import Connector
@@ -73,6 +73,10 @@ class IEC104Connector(Connector, Thread):
         self._attribute_updates: List[Dict[str, Any]] = []
         self._rpc_requests: List[Dict[str, Any]] = []
 
+        self._reconnect_lock = Lock()
+        self._reconnect_period = int(config.get("reconnectPeriod", 5))
+        self._next_reconnect_time: float = 0.0
+
         self._load_devices(config.get("devices", []))
 
     # region base connector API
@@ -127,10 +131,11 @@ class IEC104Connector(Connector, Thread):
         self._log.info("Starting IEC-104 connector")
         try:
             self._client.connect()
-            self._connected = True
+            self._connected = getattr(self._client, "is_connected", lambda: True)()
         except Exception as e:  # pragma: no cover - connection errors are logged only
             self._log.exception("Failed to establish IEC-104 connection: %s", e)
             self._connected = False
+            self._handle_connection_loss(e)
 
         self._processing_thread = Thread(target=self._process_data, daemon=True, name="IEC104 Data Processor")
         self._processing_thread.start()
@@ -150,8 +155,19 @@ class IEC104Connector(Connector, Thread):
                 thread.start()
                 self._polling_threads.append(thread)
 
-        while not self._stopped.is_set():
-            sleep(1)
+        while not self._stopped.wait(1):
+            try:
+                client_is_connected = getattr(self._client, "is_connected", lambda: True)()
+            except Exception:  # pragma: no cover - defensive logging
+                client_is_connected = False
+
+            if client_is_connected:
+                if not self._connected:
+                    self._connected = True
+            else:
+                if self._connected:
+                    self._connected = False
+                self._handle_connection_loss(ConnectionError("IEC-104 client reported disconnection"))
 
     # region ThingsBoard handlers
     def on_attributes_update(self, content):
@@ -202,6 +218,16 @@ class IEC104Connector(Connector, Thread):
     # region internal helpers
     def _load_devices(self, devices: List[Dict[str, Any]]) -> None:
         for device in devices:
+            device_common_address = self._normalize_address(device.get("commonAddress"))
+            if device_common_address is None and device.get("commonAddress") is not None:
+                self._log.error(
+                    "IEC-104 device %s has invalid commonAddress %r",
+                    device.get("deviceName"),
+                    device.get("commonAddress"),
+                )
+            elif device_common_address is not None:
+                device["commonAddress"] = device_common_address
+
             converter_class_name = device.get("converter", DEFAULT_UPLINK_CONVERTER)
             converter_cls = TBModuleLoader.import_module(self._connector_type, converter_class_name)
             if not converter_cls:
@@ -211,11 +237,31 @@ class IEC104Connector(Connector, Thread):
             converter = converter_cls(device, self._converter_log)
 
             for point in device.get("points", []):
-                common_address = point.get("commonAddress", device.get("commonAddress"))
-                io_address = point.get("ioAddress")
-                if io_address is None:
-                    self._log.error("IEC-104 point in device %s is missing ioAddress", device.get("deviceName"))
+                point_common_address_raw = point.get("commonAddress", device.get("commonAddress"))
+                common_address = self._normalize_address(point_common_address_raw)
+                if common_address is None:
+                    self._log.error(
+                        "IEC-104 point %s in device %s has invalid commonAddress %r",
+                        point.get("name"),
+                        device.get("deviceName"),
+                        point_common_address_raw,
+                    )
                     continue
+
+                io_address_raw = point.get("ioAddress")
+                io_address = self._normalize_address(io_address_raw)
+                if io_address is None:
+                    self._log.error(
+                        "IEC-104 point %s in device %s has invalid ioAddress %r",
+                        point.get("name"),
+                        device.get("deviceName"),
+                        io_address_raw,
+                    )
+                    continue
+
+                point["ioAddress"] = io_address
+                if "commonAddress" in point:
+                    point["commonAddress"] = common_address
 
                 key = (common_address, io_address)
                 self._points_map[key] = {
@@ -236,6 +282,28 @@ class IEC104Connector(Connector, Thread):
         prepared.setdefault("methodFilter", config.get("method", ".*"))
         prepared.setdefault("attributeFilter", config.get("attribute", ".*"))
         prepared.setdefault("commonAddress", config.get("commonAddress", device.get("commonAddress")))
+
+        prepared_common_address = self._normalize_address(prepared.get("commonAddress"))
+        if prepared_common_address is not None:
+            prepared["commonAddress"] = prepared_common_address
+        elif prepared.get("commonAddress") is not None:
+            self._log.error(
+                "IEC-104 configuration for device %s has invalid commonAddress %r",
+                device.get("deviceName"),
+                prepared.get("commonAddress"),
+            )
+
+        if "ioAddress" in prepared:
+            prepared_io_address = self._normalize_address(prepared.get("ioAddress"))
+            if prepared_io_address is not None:
+                prepared["ioAddress"] = prepared_io_address
+            elif prepared.get("ioAddress") is not None:
+                self._log.error(
+                    "IEC-104 configuration for device %s has invalid ioAddress %r",
+                    device.get("deviceName"),
+                    prepared.get("ioAddress"),
+                )
+
         prepared["device"] = device
         prepared["point"] = config
 
@@ -248,16 +316,53 @@ class IEC104Connector(Connector, Thread):
         prepared["converter"] = converter_cls(config, self._converter_log)
         return prepared
 
+    @staticmethod
+    def _normalize_address(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
     def _poll_device(self, device: Dict[str, Any], poll_period: int) -> None:
         while not self._stopped.wait(poll_period):
             try:
+                self._log.debug(
+                    "Starting IEC-104 interrogation for device %s with %s configured points",
+                    device.get("deviceName"),
+                    len(device.get("points", [])),
+                )
                 responses = self._client.interrogate(device, device.get("points", []))
+                self._log.debug(
+                    "IEC-104 interrogation for device %s returned %s responses",
+                    device.get("deviceName"),
+                    len(responses) if isinstance(responses, list) else "unknown",
+                )
                 for response in responses:
                     self._on_point_update(response)
+            except ConnectionError as exc:
+                self._log.warning(
+                    "Failed to interrogate IEC-104 device %s due to connection issue: %s",
+                    device.get("deviceName"),
+                    exc,
+                )
+                self._connected = False
+                self._handle_connection_loss(exc)
             except Exception:  # pragma: no cover - defensive logging
                 self._log.exception("Failed to interrogate IEC-104 device %s", device.get("deviceName"))
 
     def _on_point_update(self, data: Dict[str, Any]) -> None:
+        self._log.debug(
+            "Queueing IEC-104 update CA=%s IOA=%s value=%r quality=%s cause=%s",
+            data.get("common_address"),
+            data.get("io_address"),
+            data.get("value"),
+            data.get("quality"),
+            data.get("cause"),
+        )
         self._data_queue.put(data)
 
     def _process_data(self) -> None:
@@ -270,16 +375,28 @@ class IEC104Connector(Connector, Thread):
             key = (item.get("common_address"), item.get("io_address"))
             mapping = self._points_map.get(key)
             if not mapping:
-                self._log.debug("Received IEC-104 update for unknown point %s", key)
+                self._log.debug(
+                    "Received IEC-104 update for unknown point %s (known points: %s)",
+                    key,
+                    list(self._points_map.keys()),
+                )
                 continue
 
             converter = mapping["converter"]
             converted: ConvertedData = converter.convert(mapping, item)
 
             if converted.telemetry_datapoints_count or converted.attributes_datapoints_count:
-                self._log.debug("Converted IEC-104 data: %s", converted)
+                self._log.info(
+                    "Collected IEC-104 data: %s",
+                    converted.to_dict(debug_enabled=True),
+                )
                 StatisticsService.count_connector_message(self.name, 'convertedMessages', count=1)
                 self._gateway.send_to_storage(self.get_name(), self.get_id(), converted)
+            else:
+                self._log.debug(
+                    "IEC-104 update for point %s produced no telemetry or attributes after conversion",
+                    key,
+                )
 
     def _process_commands(self) -> None:
         while not self._stopped.is_set():
@@ -298,6 +415,17 @@ class IEC104Connector(Connector, Thread):
                         req_id=originator["data"]["id"],
                         content=result if result is not None else {"success": True},
                     )
+            except ConnectionError as exc:
+                self._log.warning("Failed to send IEC-104 command due to connection issue: %s", exc)
+                self._connected = False
+                self._handle_connection_loss(exc)
+                if originator:
+                    self._gateway.send_rpc_reply(
+                        device=originator["device"],
+                        req_id=originator["data"]["id"],
+                        content={"error": str(exc)},
+                        success_sent=False,
+                    )
             except Exception as e:  # pragma: no cover - defensive logging
                 self._log.exception("Failed to send IEC-104 command: %s", e)
                 if originator:
@@ -308,3 +436,47 @@ class IEC104Connector(Connector, Thread):
                         success_sent=False,
                     )
     # endregion
+
+    def _handle_connection_loss(self, error: Exception) -> None:
+        if self._stopped.is_set():
+            return
+
+        client_is_connected = getattr(self._client, "is_connected", lambda: False)
+        if client_is_connected():
+            self._connected = True
+            return
+
+        reconnect_period = max(self._reconnect_period, 0)
+        with self._reconnect_lock:
+            if client_is_connected():
+                self._connected = True
+                return
+
+            now = time()
+            if reconnect_period and self._next_reconnect_time and now < self._next_reconnect_time:
+                return
+
+            if reconnect_period:
+                self._next_reconnect_time = now + reconnect_period
+            else:
+                self._next_reconnect_time = 0.0
+
+            self._log.warning("IEC-104 connection lost (%s). Attempting to reconnect.", error)
+
+            try:
+                self._client.close()
+            except Exception:  # pragma: no cover - defensive logging
+                self._log.debug("Failed to close IEC-104 client before reconnecting", exc_info=True)
+
+            try:
+                self._client.connect()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self._log.warning("IEC-104 reconnect attempt failed: %s", exc)
+                return
+
+            self._connected = getattr(self._client, "is_connected", lambda: True)()
+            if self._connected:
+                self._log.info("IEC-104 client reconnected successfully")
+                self._next_reconnect_time = 0.0
+            else:
+                self._log.warning("IEC-104 client reconnect attempt did not establish connection")

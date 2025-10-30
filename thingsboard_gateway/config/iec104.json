@@ -23,20 +23,23 @@
       },
       "points": [
         {
-          "name": "Voltage",
-          "ioAddress": 1001,
+          "name": "voltage",
+          "ioAddress": 1,
           "type": "telemetry",
           "key": "voltage",
-          "defaultValue": 220.0,
           "simulate": true
         },
         {
           "name": "SwitchState",
-          "ioAddress": 2001,
-          "type": "attribute",
-          "key": "switch",
-          "defaultValue": "open",
-          "simulate": true
+          "ioAddress": 2,
+          "type": "telemetry",
+          "key": "switch"
+        },
+        {
+          "name": "current",
+          "ioAddress": 11,
+          "type": "telemetry",
+          "key": "current"
         }
       ],
       "serverSideRpc": [
@@ -49,5 +52,6 @@
         }
       ]
     }
-  ]
+  ],
+  "id": "d8964307-b2c3-4625-95c2-19483369aac0"
 }

@@ -112,9 +112,14 @@ RPC_ID_PARAMETER = "id"
 RPC_METHOD_PARAMETER = "method"
 RPC_PARAMS_PARAMETER = "params"
 DATA_PARAMETER = "data"
-RPC_DEFAULT_TIMEOUT=5
+RPC_DEFAULT_TIMEOUT = 5
 RPC_CONNECTOR_ARGUMENTS_PARAMETER = "arguments"
 RPC_VALUE_PARAMETER = "value"
+
+# Attribute updates constants
+
+ATTRIBUTE_UPDATE_METHOD_PARAMETER = "method"
+ATTRIBUTE_UPDATE_PARAMS_PARAMETER = "params"
 
 # Attribute constants
 ATTRIBUTES_FOR_REQUEST = ["RemoteLoggingLevel", "general_configuration", "storage_configuration",

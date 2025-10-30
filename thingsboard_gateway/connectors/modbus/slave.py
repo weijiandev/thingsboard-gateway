@@ -46,6 +46,7 @@ from thingsboard_gateway.connectors.modbus.constants import (
 )
 from thingsboard_gateway.connectors.modbus.entities.bytes_uplink_converter_config import BytesUplinkConverterConfig
 from thingsboard_gateway.connectors.modbus.modbus_converter import ModbusConverter
+from thingsboard_gateway.connectors.modbus.utils import Utils
 from thingsboard_gateway.gateway.constants import (
     DEVICE_NAME_PARAMETER,
     DEVICE_TYPE_PARAMETER,
@@ -88,7 +89,7 @@ class Slave(Thread):
         self.method = config[METHOD_PARAMETER].upper()
         self.tls = config.get('tls', {})
         self.timeout = config.get(TIMEOUT_PARAMETER, 30)
-        self.retries = config.get(RETRIES_PARAMETER, 3)
+        self.retries = self.parse_retries_from_config(config.get(RETRIES_PARAMETER, 3))
         self.baudrate = config.get(BAUDRATE_PARAMETER, 19200)
         self.stopbits = config.get(STOPBITS_PARAMETER, PymodbusDefaults.Stopbits)
         self.bytesize = config.get(BYTESIZE_PARAMETER, PymodbusDefaults.Bytesize)
@@ -252,6 +253,9 @@ class Slave(Thread):
         self._log.debug('Reading %s registers from address %s with function code %s', objects_count, address,
                         function_code)
 
+        if Utils.is_wide_range_request(address):
+            address, objects_count = Utils.parse_wide_range_request(address, objects_count)
+
         result = await self.__read(function_code, address, objects_count)
 
         StatisticsService.count_connector_message(self.connector.get_name(),
@@ -336,3 +340,14 @@ class Slave(Thread):
 
     def __str__(self):
         return f'{self.device_name}'
+
+    @staticmethod
+    def parse_retries_from_config(value):
+        if isinstance(value, bool):
+            return 3 if value is True else 0
+        elif isinstance(value, int):
+            if value < 0:
+                raise ValueError('Retries parameter must be a non-negative integer')
+            return value
+        else:
+            raise ValueError('Retries parameter must be int or bool')
